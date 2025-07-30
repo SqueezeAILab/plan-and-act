@@ -1,4 +1,4 @@
-# Plan-and-Act: A Framework for Accurate and Reliable Long-Horizon Task Solving
+# Plan-and-Act: A Framework for Accurate and Reliable Long-Horizon Task Solving [[Paper](https://arxiv.org/abs/2503.09572)]
 
 ![Plan-and-Act Framework Overview](Plan-And-Act.jpg)
 
