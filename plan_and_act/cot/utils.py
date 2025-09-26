@@ -1,5 +1,7 @@
 import asyncio
 import re
+import unicodedata as ud
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import AbstractSet, Any, Coroutine, Iterable, TypeVar, cast
 
@@ -859,3 +861,191 @@ After taking all the previous actions, the user exits the task with the followin
     exit_action_str.append(format_action_string(last_exit_action, use_simple_html=True))
 
     return "\n".join(exit_action_str)
+
+
+# --- Controls/format chars to delete outright ---
+_DELETE_CODEPOINTS = {
+    0x00AD,  # soft hyphen
+    0x180E,  # Mongolian vowel separator (deprecated)
+    0x200B,
+    0x200C,
+    0x200D,  # ZWSP, ZWNJ, ZWJ
+    0x200E,
+    0x200F,  # LRM, RLM
+    0x202A,
+    0x202B,
+    0x202C,
+    0x202D,
+    0x202E,  # BiDi embeddings/overrides
+    0x2060,  # word joiner
+    0x2066,
+    0x2067,
+    0x2068,
+    0x2069,  # LRI, RLI, FSI, PDI
+    0xFE0E,
+    0xFE0F,  # variation selectors
+    0xFEFF,  # ZWNBSP/BOM
+}
+
+# --- Map all dash-like to ASCII '-' ---
+_DASH_CODEPOINTS = {
+    0x2010,
+    0x2011,
+    0x2012,
+    0x2013,
+    0x2014,
+    0x2015,  # hyphen..horizontal bar
+    0x2043,  # hyphen bullet
+    0x2053,  # swung dash
+    0x2212,  # minus sign
+    0x2E3A,
+    0x2E3B,  # two-/three-em dash
+    0x2E40,  # double hyphen
+    0x301C,
+    0x3030,  # wave dashes
+    0xFE58,
+    0xFE63,
+    0xFF0D,  # small em dash, small/fullwidth hyphen
+}
+
+# --- Map exotic spaces to ASCII space ---
+_SPACE_CODEPOINTS = {
+    0x00A0,
+    0x1680,
+    0x2000,
+    0x2001,
+    0x2002,
+    0x2003,
+    0x2004,
+    0x2005,
+    0x2006,
+    0x2007,
+    0x2008,
+    0x2009,
+    0x200A,
+    0x202F,
+    0x205F,
+    0x3000,
+}
+
+# --- Slash look-alikes to '/' ---
+_SLASH_MAP = {
+    "／": "/",  # fullwidth slash U+FF0F
+    "⁄": "/",  # fraction slash U+2044
+    "∕": "/",  # division slash U+2215
+}
+
+# --- Quote normalization (yours + a couple extras) ---
+_QUOTE_MAP = str.maketrans(
+    {
+        "“": '"',
+        "”": '"',
+        "„": '"',
+        "‟": '"',
+        "＂": '"',
+        "’": "'",
+        "‘": "'",
+        "‚": "'",
+        "′": "'",
+        "＇": "'",
+    }
+)
+
+# Precompute translate table
+_TRANS = {}
+_TRANS.update({cp: None for cp in _DELETE_CODEPOINTS})
+_TRANS.update({cp: ord("-") for cp in _DASH_CODEPOINTS})
+_TRANS.update({cp: ord(" ") for cp in _SPACE_CODEPOINTS})
+# Add slash map
+_TRANS.update({ord(k): ord(v) for k, v in _SLASH_MAP.items()})
+
+
+def _strip_diacritics(s: str) -> str:
+    # NFKD + drop combining marks, then back to NFC
+    decomp = ud.normalize("NFKD", s)
+    s = "".join(ch for ch in decomp if not ud.combining(ch))
+    return ud.normalize("NFC", s)
+
+
+def canonicalize(s: str) -> str:
+    # 1) Compatibility normalize + casefold (handles fullwidth, ligatures, etc.)
+    s = ud.normalize("NFKC", s).casefold()
+
+    # 2) Remove diacritics
+    s = _strip_diacritics(s)
+
+    # 3) Translate: delete controls, unify dashes/spaces/slashes
+    s = s.translate(_TRANS)
+
+    # 4) Normalize quotes
+    s = s.translate(_QUOTE_MAP)
+
+    # 5) Collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _variants(s: str) -> Iterable[str]:
+    # Treat runs of separators equivalently: -, _, /, . → space or removal
+    yield s
+    sep_re = r"[-_/\.]+"
+    yield re.sub(sep_re, " ", s)
+    yield re.sub(sep_re, "", s)
+
+
+def _tokenize_alnum(s: str):
+    # Unicode-aware: split on non-alnum
+    out, buf = [], []
+    for ch in s:
+        if ch.isalnum():
+            buf.append(ch)
+        else:
+            if buf:
+                out.append("".join(buf))
+                buf.clear()
+    if buf:
+        out.append("".join(buf))
+    return out
+
+
+def must_include(ref: str, pred: str, *, token_subset_any_len: bool = True) -> float:
+    ref_c = canonicalize(ref)
+    pred_c = canonicalize(pred)
+
+    # Fast path: separator-insensitive substring checks both ways
+    for r in _variants(ref_c):
+        for p in _variants(pred_c):
+            if r and (r in p):
+                return 1.0
+
+    # Token-level subset check (for any length, not just single-token refs)
+    if token_subset_any_len:
+        ta, tb = set(_tokenize_alnum(ref_c)), set(_tokenize_alnum(pred_c))
+        if ta and (ta <= tb):
+            return 1.0
+    else:
+        # Your original single-token special case
+        rtoks = ref_c.split()
+        if len(rtoks) == 1:
+            ptoks = re.split(r"[^\w]+", pred_c)
+            if rtoks[0] in filter(None, ptoks):
+                return 1.0
+
+    return 0.0
+
+
+def exact_match(ref: str, pred: str) -> float:
+    if isinstance(pred, int):
+        pred = str(pred)
+    a = canonicalize(str(ref))
+    b = canonicalize(pred)
+    if a == b:
+        return 1.0
+    a_vars = list(_variants(a))
+    b_vars = list(_variants(b))
+    if any(x == y for x in a_vars for y in b_vars):
+        return 1.0
+
+    ta = Counter(_tokenize_alnum(a))
+    tb = Counter(_tokenize_alnum(b))
+    return float(ta == tb)
